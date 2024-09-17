@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rsa"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,39 +31,36 @@ import (
 	_ "github.com/docker/distribution/registry/storage/driver/s3-aws"
 
 	"github.com/daocloud/crproxy"
+	"github.com/daocloud/crproxy/internal/pki"
 	"github.com/daocloud/crproxy/internal/server"
+	"github.com/daocloud/crproxy/signing"
+	"github.com/daocloud/crproxy/token"
 )
 
 var (
-	behind                      bool
-	address                     string
-	userpass                    []string
-	disableKeepAlives           []string
-	limitDelay                  bool
-	blobsSpeedLimit             string
-	ipsSpeedLimit               string
-	totalBlobsSpeedLimit        string
-	allowHostList               []string
-	allowImageListFromFile      string
-	blockImageList              []string
-	blockMessage                string
-	privilegedIPList            []string
-	privilegedImageListFromFile string
-	privilegedNoAuth            bool
-	retry                       int
-	retryInterval               time.Duration
-	storageDriver               string
-	storageParameters           map[string]string
-	linkExpires                 time.Duration
-	redirectLinks               string
-	disableTagsList             bool
-	enablePprof                 bool
-	defaultRegistry             string
-	overrideDefaultRegistry     map[string]string
-	simpleAuth                  bool
-	simpleAuthUserpass          map[string]string
-	tokenURL                    string
-	tokenAuthForceTLS           bool
+	behind                  bool
+	address                 string
+	userpass                []string
+	disableKeepAlives       []string
+	blobsSpeedLimit         string
+	ipsSpeedLimit           string
+	totalBlobsSpeedLimit    string
+	allowImageListFromFile  string
+	blockMessage            string
+	privilegedIPList        []string
+	retry                   int
+	retryInterval           time.Duration
+	storageDriver           string
+	storageParameters       map[string]string
+	linkExpires             time.Duration
+	redirectLinks           string
+	disableTagsList         bool
+	enablePprof             bool
+	defaultRegistry         string
+	overrideDefaultRegistry map[string]string
+	simpleAuth              bool
+	simpleAuthUserpass      map[string]string
+	tokenURL                string
 
 	redirectOriginBlobLinks bool
 
@@ -74,9 +73,10 @@ var (
 
 	readmeURL string
 
-	allowHeadMethod bool
-
 	manifestCacheDuration time.Duration
+
+	tokenPrivateKeyFile string
+	tokenPublicKeyFile  string
 )
 
 func init() {
@@ -84,17 +84,12 @@ func init() {
 	pflag.StringSliceVarP(&userpass, "user", "u", nil, "host and username and password -u user:pwd@host")
 	pflag.StringVarP(&address, "address", "a", ":8080", "listen on the address")
 	pflag.StringSliceVar(&disableKeepAlives, "disable-keep-alives", nil, "disable keep alives for the host")
-	pflag.BoolVar(&limitDelay, "limit-delay", false, "limit with delay")
 	pflag.StringVar(&blobsSpeedLimit, "blobs-speed-limit", "", "blobs speed limit per second (default unlimited)")
 	pflag.StringVar(&ipsSpeedLimit, "ips-speed-limit", "", "ips speed limit per second (default unlimited)")
 	pflag.StringVar(&totalBlobsSpeedLimit, "total-blobs-speed-limit", "", "total blobs speed limit per second (default unlimited)")
-	pflag.StringSliceVar(&allowHostList, "allow-host-list", nil, "allow host list")
 	pflag.StringVar(&allowImageListFromFile, "allow-image-list-from-file", "", "allow image list from file")
-	pflag.StringSliceVar(&blockImageList, "block-image-list", nil, "block image list (deprecated)")
 	pflag.StringVar(&blockMessage, "block-message", "", "block message")
 	pflag.StringSliceVar(&privilegedIPList, "privileged-ip-list", nil, "privileged IP list")
-	pflag.BoolVar(&privilegedNoAuth, "privileged-no-auth", false, "privileged no auth (deprecated)")
-	pflag.StringVar(&privilegedImageListFromFile, "privileged-image-list-from-file", "", "privileged image list from file")
 	pflag.IntVar(&retry, "retry", 0, "retry times")
 	pflag.DurationVar(&retryInterval, "retry-interval", 0, "retry interval")
 	pflag.StringVar(&storageDriver, "storage-driver", "", "storage driver")
@@ -107,8 +102,7 @@ func init() {
 	pflag.StringToStringVar(&overrideDefaultRegistry, "override-default-registry", nil, "override default registry")
 	pflag.BoolVar(&simpleAuth, "simple-auth", false, "enable simple auth")
 	pflag.StringToStringVar(&simpleAuthUserpass, "simple-auth-user", nil, "simple auth user and password")
-	pflag.StringVar(&tokenURL, "token-url", "", "token url (deprecated)")
-	pflag.BoolVar(&tokenAuthForceTLS, "token-auth-force-tls", false, "token auth force TLS (deprecated)")
+	pflag.StringVar(&tokenURL, "token-url", "/auth/token", "token url")
 
 	pflag.BoolVar(&redirectOriginBlobLinks, "redirect-origin-blob-links", false, "redirect origin blob links")
 
@@ -119,9 +113,11 @@ func init() {
 	pflag.BoolVar(&enableInternalAPI, "enable-internal-api", false, "enable internal api")
 
 	pflag.StringVar(&readmeURL, "readme-url", "", "redirect readme url when not found")
-	pflag.BoolVar(&allowHeadMethod, "allow-head-method", false, "allow head method")
 
 	pflag.DurationVar(&manifestCacheDuration, "manifest-cache-duration", 0, "manifest cache duration")
+
+	pflag.StringVar(&tokenPrivateKeyFile, "token-private-key-file", "", "private key file")
+	pflag.StringVar(&tokenPublicKeyFile, "token-public-key-file", "", "public key file")
 	pflag.Parse()
 }
 
@@ -265,105 +261,10 @@ func main() {
 		opts = append(opts, crproxy.WithBlockFunc(func(info *crproxy.ImageInfo) bool {
 			return !(*matcher.Load()).Match(info.Host + "/" + info.Name)
 		}))
-	} else if len(blockImageList) != 0 || len(allowHostList) != 0 {
-		allowHostMap := map[string]struct{}{}
-		for _, host := range allowHostList {
-			allowHostMap[host] = struct{}{}
-		}
-		blockImageMap := map[string]struct{}{}
-		for _, image := range blockImageList {
-			blockImageMap[image] = struct{}{}
-		}
-		opts = append(opts, crproxy.WithBlockFunc(func(info *crproxy.ImageInfo) bool {
-			if len(allowHostMap) != 0 {
-				_, ok := allowHostMap[info.Host]
-				if !ok {
-					return true
-				}
-			}
-
-			if len(blockImageMap) != 0 {
-				image := info.Host + "/" + info.Name
-				_, ok := blockImageMap[image]
-				if ok {
-					return true
-				}
-			}
-
-			return false
-		}))
 	}
 
 	if blockMessage != "" {
 		opts = append(opts, crproxy.WithBlockMessage(blockMessage))
-	}
-
-	if len(privilegedIPList) != 0 || privilegedImageListFromFile != "" {
-		var matcher atomic.Pointer[hostmatcher.Matcher]
-		if privilegedImageListFromFile != "" {
-			f, err := os.ReadFile(privilegedImageListFromFile)
-			if err != nil {
-				logger.Println("can't read privileged list file %s", privilegedImageListFromFile)
-				os.Exit(1)
-			}
-
-			m, err := getListFrom(bytes.NewReader(f))
-			if err != nil {
-				logger.Println("can't read privileged list file %s", privilegedImageListFromFile)
-				os.Exit(1)
-			}
-			matcher.Store(&m)
-
-			if enableInternalAPI {
-				mux.HandleFunc("PUT /internal/api/privileged", func(rw http.ResponseWriter, r *http.Request) {
-					body, err := io.ReadAll(r.Body)
-					if err != nil {
-						logger.Println("read body failed:", err)
-						rw.WriteHeader(http.StatusBadRequest)
-						rw.Write([]byte(err.Error()))
-						return
-					}
-					m, err := getListFrom(bytes.NewReader(body))
-					if err != nil {
-						logger.Println("can't read allow list file %s", privilegedImageListFromFile)
-						rw.WriteHeader(http.StatusBadRequest)
-						rw.Write([]byte(err.Error()))
-						return
-					}
-
-					err = os.WriteFile(privilegedImageListFromFile, body, 0644)
-					if err != nil {
-						logger.Println("write file failed:", err)
-						rw.WriteHeader(http.StatusBadRequest)
-						rw.Write([]byte(err.Error()))
-						return
-					}
-
-					matcher.Store(&m)
-				})
-			}
-		}
-
-		set := map[string]struct{}{}
-		for _, ip := range privilegedIPList {
-			set[ip] = struct{}{}
-		}
-		opts = append(opts, crproxy.WithPrivilegedFunc(func(r *http.Request, info *crproxy.ImageInfo) bool {
-			if len(set) != 0 {
-				ip := r.RemoteAddr
-				if _, ok := set[ip]; ok {
-					return true
-				}
-			}
-			if m := matcher.Load(); m != nil && info != nil {
-				return (*m).Match(info.Host + "/" + info.Name)
-			}
-			return false
-		}))
-	}
-
-	if privilegedNoAuth {
-		opts = append(opts, crproxy.WithPrivilegedNoAuth(true))
 	}
 
 	if len(userpass) != 0 {
@@ -409,9 +310,6 @@ func main() {
 	if retry > 0 {
 		opts = append(opts, crproxy.WithRetry(retry, retryInterval))
 	}
-	if limitDelay {
-		opts = append(opts, crproxy.WithLimitDelay(true))
-	}
 
 	if defaultRegistry != "" {
 		opts = append(opts, crproxy.WithDefaultRegistry(defaultRegistry))
@@ -422,34 +320,131 @@ func main() {
 	}
 
 	if simpleAuth {
-		opts = append(opts, crproxy.WithSimpleAuth(true, tokenURL, tokenAuthForceTLS))
-	}
-	if len(simpleAuthUserpass) != 0 {
+		var privateKey *rsa.PrivateKey
+		var publicKey *rsa.PublicKey
+		if tokenPrivateKeyFile == "" && tokenPublicKeyFile == "" {
+			k, err := pki.GenerateKey()
+			if err != nil {
+				logger.Println("failed to GenerateKey:", err)
+				os.Exit(1)
+			}
+			privateKey = k
+			publicKey = &k.PublicKey
+		} else {
+			if tokenPrivateKeyFile != "" {
+				privateKeyData, err := os.ReadFile(tokenPrivateKeyFile)
+				if err != nil {
+					if !errors.Is(err, os.ErrNotExist) {
+						logger.Println("failed to ReadFile:", err)
+						os.Exit(1)
+					}
+					logger.Println("generate key")
+					k, err := pki.GenerateKey()
+					if err != nil {
+						logger.Println("failed to GenerateKey:", err)
+						os.Exit(1)
+					}
+					privateKeyData, err = pki.EncodePrivateKey(k)
+					if err != nil {
+						logger.Println("failed to EncodePrivateKey:", err)
+						os.Exit(1)
+					}
+					err = os.WriteFile(tokenPrivateKeyFile, privateKeyData, 0640)
+					if err != nil {
+						logger.Println("failed to WriteFile:", err)
+						os.Exit(1)
+					}
+				}
+				k, err := pki.DecodePrivateKey(privateKeyData)
+				if err != nil {
+					logger.Println("failed to DecodePrivateKey:", err)
+					os.Exit(1)
+				}
+				privateKey = k
+			}
 
-		opts = append(opts, crproxy.WithSimpleAuthUserFunc(func(r *http.Request, userinfo *url.Userinfo) bool {
-			pass, ok := simpleAuthUserpass[userinfo.Username()]
-			if !ok {
-				return false
+			if tokenPublicKeyFile != "" {
+				publicKeyData, err := os.ReadFile(tokenPublicKeyFile)
+				if err != nil {
+					if privateKey == nil || !errors.Is(err, os.ErrNotExist) {
+						logger.Println("failed to ReadFile:", err)
+						os.Exit(1)
+					}
+					publicKeyData, err = pki.EncodePublicKey(&privateKey.PublicKey)
+					if err != nil {
+						logger.Println("failed to EncodePublicKey:", err)
+						os.Exit(1)
+					}
+					err = os.WriteFile(tokenPublicKeyFile, publicKeyData, 0640)
+					if err != nil {
+						logger.Println("failed to WriteFile:", err)
+						os.Exit(1)
+					}
+				}
+				k, err := pki.DecodePublicKey(publicKeyData)
+				if err != nil {
+					logger.Println("failed to DecodePublicKey:", err)
+					os.Exit(1)
+				}
+				publicKey = k
+			} else if privateKey != nil {
+				publicKey = &privateKey.PublicKey
 			}
-			upass, ok := userinfo.Password()
-			if !ok {
-				return false
+		}
+
+		authenticator := token.NewAuthenticator(token.NewDecoder(signing.NewVerifier(publicKey)), tokenURL)
+		opts = append(opts, crproxy.WithAuthenticator(authenticator))
+
+		if privateKey != nil {
+			privilegedIPSets := map[string]struct{}{}
+			if len(privilegedIPList) != 0 {
+				for _, ip := range privilegedIPList {
+					privilegedIPSets[ip] = struct{}{}
+				}
 			}
-			if upass != pass {
-				return false
+
+			auth := func(r *http.Request, userinfo *url.Userinfo) (token.Attribute, bool) {
+				if len(privilegedIPSets) != 0 {
+					ip := r.RemoteAddr
+					if _, ok := privilegedIPSets[ip]; ok {
+						return token.Attribute{
+							NoRateLimit:   true,
+							NoAllowlist:   true,
+							AllowTagsList: true,
+						}, true
+					}
+				}
+
+				if userinfo == nil {
+					return token.Attribute{}, false
+				}
+
+				pass, ok := simpleAuthUserpass[userinfo.Username()]
+				if !ok {
+					return token.Attribute{}, false
+				}
+				upass, ok := userinfo.Password()
+				if !ok {
+					return token.Attribute{}, false
+				}
+				if upass != pass {
+					return token.Attribute{}, false
+				}
+				return token.Attribute{
+					NoRateLimit:   true,
+					NoAllowlist:   true,
+					AllowTagsList: true,
+				}, true
 			}
-			return true
-		}))
+			gen := token.NewGenerator(token.NewEncoder(signing.NewSigner(privateKey)), auth, logger)
+			mux.Handle("/auth/token", gen)
+		}
 	}
 
 	if redirectOriginBlobLinks {
 		opts = append(opts, crproxy.WithRedirectToOriginBlobFunc(func(r *http.Request, info *crproxy.ImageInfo) bool {
 			return true
 		}))
-	}
-
-	if allowHeadMethod {
-		opts = append(opts, crproxy.WithAllowHeadMethod(allowHeadMethod))
 	}
 
 	if manifestCacheDuration != 0 {
@@ -463,9 +458,10 @@ func main() {
 	}
 
 	mux.Handle("/v2/", crp)
-	mux.HandleFunc("/auth/token", crp.AuthToken)
 
-	mux.HandleFunc("/internal/api/image/sync", crp.Sync)
+	if enableInternalAPI {
+		mux.HandleFunc("/internal/api/image/sync", crp.Sync)
+	}
 
 	if enablePprof {
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
