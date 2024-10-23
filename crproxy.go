@@ -687,7 +687,7 @@ func (c *CRProxy) redirect(rw http.ResponseWriter, r *http.Request, blobPath str
 	}
 	u, err := c.storageDriver.URLFor(r.Context(), blobPath, options)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get URL: %v", err)
 	}
 	if c.logger != nil {
 		c.logger.Println("Cache hit", blobPath, u)

@@ -38,3 +38,5 @@ Just add the prefix `m.daocloud.io/`
 ``` yaml
 image: m.daocloud.io/docker.io/library/busybox
 ```
+
+go run cmd/crproxy/main.go --address :9090 --storage-driver filesystem --storage-parameters rootdirectory=~/crproxy/bin

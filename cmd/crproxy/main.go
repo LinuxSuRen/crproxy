@@ -25,6 +25,7 @@ import (
 	_ "github.com/daocloud/crproxy/storage/driver/obs"
 	_ "github.com/daocloud/crproxy/storage/driver/oss"
 	_ "github.com/docker/distribution/registry/storage/driver/azure"
+	_ "github.com/docker/distribution/registry/storage/driver/filesystem"
 	_ "github.com/docker/distribution/registry/storage/driver/gcs"
 	_ "github.com/docker/distribution/registry/storage/driver/s3-aws"
 
@@ -245,7 +246,7 @@ func main() {
 				}
 				m, err := getListFrom(bytes.NewReader(body))
 				if err != nil {
-					logger.Println("can't read allow list file %s", allowImageListFromFile)
+					logger.Println("can't read allow list file", allowImageListFromFile)
 					rw.WriteHeader(http.StatusBadRequest)
 					rw.Write([]byte(err.Error()))
 					return
@@ -303,13 +304,13 @@ func main() {
 		if privilegedImageListFromFile != "" {
 			f, err := os.ReadFile(privilegedImageListFromFile)
 			if err != nil {
-				logger.Println("can't read privileged list file %s", privilegedImageListFromFile)
+				logger.Println("can't read privileged list file", privilegedImageListFromFile)
 				os.Exit(1)
 			}
 
 			m, err := getListFrom(bytes.NewReader(f))
 			if err != nil {
-				logger.Println("can't read privileged list file %s", privilegedImageListFromFile)
+				logger.Println("can't read privileged list file", privilegedImageListFromFile)
 				os.Exit(1)
 			}
 			matcher.Store(&m)
